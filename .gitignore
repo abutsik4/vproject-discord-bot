@@ -21,6 +21,9 @@ data/messages.json
 data/recruitment-architecture-state.json
 data/recruitment-role-requests.json
 
+# Embeds library is edited at runtime (lastMessageId/lastChannelId)
+data/embeds.json
+
 # OS
 .DS_Store
 Thumbs.db
