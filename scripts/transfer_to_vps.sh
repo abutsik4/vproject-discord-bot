@@ -8,15 +8,15 @@ set -euo pipefail
 # - Performs a post-sync verification dry-run using checksums
 #
 # Usage examples:
-#   ./scripts/transfer_to_vps.sh --host 192.168.1.122 --user jepsen --dest /opt/vproject-bot --mode mirror
+#   ./scripts/transfer_to_vps.sh --host example.com --user ubuntu --dest /opt/vproject-bot --mode mirror
 #   ./scripts/transfer_to_vps.sh --host example.com --user root --dest /opt/vproject-bot --mode update --no-backup
 #
 # Notes:
 # - If your destination is under /opt, this script uses `sudo rsync` on the remote side.
 # - You may be prompted for the remote user's sudo password (and/or SSH password).
 
-HOST="192.168.1.122"
-USER_NAME="jepsen"
+HOST=""
+USER_NAME=""
 SSH_PORT="22"
 DEST="/opt/vproject-bot"
 MODE="mirror"   # mirror|update
@@ -28,8 +28,8 @@ print_usage() {
 Usage: transfer_to_vps.sh [options]
 
 Options:
-  --host <host>         Remote host/IP (default: 192.168.1.122)
-  --user <user>         SSH username (default: jepsen)
+  --host <host>         Remote host/IP (required)
+  --user <user>         SSH username (required)
   --port <port>         SSH port (default: 22)
   --dest <path>         Destination path on remote (default: /opt/vproject-bot)
   --mode <mirror|update>  mirror deletes extra remote files; update never deletes (default: mirror)
@@ -58,6 +58,13 @@ done
 
 if [[ "$MODE" != "mirror" && "$MODE" != "update" ]]; then
   echo "Invalid --mode: $MODE (expected mirror or update)" >&2
+  exit 2
+fi
+
+if [[ -z "$HOST" || -z "$USER_NAME" ]]; then
+  echo "Missing required args: --host and --user" >&2
+  echo >&2
+  print_usage >&2
   exit 2
 fi
 
