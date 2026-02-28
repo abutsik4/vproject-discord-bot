@@ -1,0 +1,14 @@
+[Unit]
+Description=VPROJECT Bot failure notifier for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/
+# Reuse existing notifier used by jepsencloud-bot
+ExecStart=/opt/jepsencloud-bot/scripts/telegram-notify.sh %i failure
+
+[Install]
+WantedBy=multi-user.target

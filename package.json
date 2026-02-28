@@ -1,0 +1,18 @@
+{
+    "name": "vproject-bot",
+    "version": "0.1.0",
+    "description": "VPROJECT GTA 5 RAGE MP Discord management bot",
+    "main": "src/index.js",
+    "scripts": {
+        "start": "node src/index.js",
+        "register": "node src/registerCommands.js",
+        "check:branding": "node scripts/check-branding.js",
+        "smoke:webui": "node scripts/smoke-webui.js"
+    },
+    "dependencies": {
+        "discord.js": "^14.24.2",
+        "dotenv": "^16.6.1",
+        "express": "^5.1.0",
+        "pm2": "^6.0.14"
+    }
+}

@@ -1,0 +1,26 @@
+.env
+
+# Dependencies
+node_modules/
+
+# Logs / runtime
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Backups / generated artifacts
+backups/
+
+# Local editor settings
+.vscode/
+
+# Runtime data (guild/user specific)
+data/messages.json
+data/recruitment-architecture-state.json
+data/recruitment-role-requests.json
+
+# OS
+.DS_Store
+Thumbs.db

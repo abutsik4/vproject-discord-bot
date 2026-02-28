@@ -1,0 +1,34 @@
+{
+  "default": {
+    "dryRun": false,
+    "questionsSlowmodeSec": 60,
+    "strictMentionRoleOnly": true,
+    "logChannelId": null,
+    "categoryName": "📣 • Агитационная",
+    "channels": {
+      "guide": "📌│как-пользоваться",
+      "feed": "📣│лента-объявлений",
+      "questions": "💬│вопросы-по-наборам",
+      "interview1": "🎙️│собеседование-1",
+      "interview2": "🎙️│собеседование-2",
+      "leaderTalk": "📞│разговор-с-лидером",
+      "waiting": "📝│ожидание",
+      "roleRequests": "📝│запросы-ролей",
+      "approvals": "🔐│одобрение-ролей"
+    },
+    "roles": {
+      "adminFull": "P| Admin (Full)",
+      "adminMod": "P| Admin (Mod)",
+      "devTech": "P| Dev (Tech)",
+      "leaderRecruitment": "P| Leadership (Recruitment)",
+      "deputyRecruitment": "P| Deputy (Recruitment)",
+      "memberBase": "P| Member (Base)",
+      "optInPing": "🔔 Набор открыт"
+    },
+    "pins": {
+      "rules": "[RECRUITMENT_RULES_V1]\n📌 Правила раздела набора:\n1) Читайте шаблон перед публикацией.\n2) Запрещены оффтоп и флуд в ленте объявлений.\n3) Для вопросов используйте канал \"💬│вопросы-по-наборам\".\n4) Пингуйте только роль \"🔔 Набор открыт\" при открытом наборе.",
+      "template": "[RECRUITMENT_TEMPLATE_V1]\n📝 Шаблон объявления:\n• Подразделение:\n• Требования:\n• Время набора (МСК):\n• Куда писать/ссылка:\n• Дополнительно:\n\nУпоминание разрешено только для роли \"🔔 Набор открыт\"."
+    }
+  },
+  "guilds": {}
+}

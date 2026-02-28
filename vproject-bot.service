@@ -1,0 +1,47 @@
+[Unit]
+Description=VPROJECT Discord Bot
+Documentation=https://github.com/vproject/bot
+Wants=network-online.target
+After=network-online.target
+
+# If the service enters a crash loop, don't hammer Discord reconnect/identify.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Send Telegram warning (uses jepsencloud-bot notifier)
+OnFailure=vproject-bot-failure@%n.service
+
+[Service]
+Type=simple
+User=jepsen
+WorkingDirectory=/opt/vproject-bot
+
+# Load secrets and config (DISCORD_TOKEN, PORT, etc.)
+EnvironmentFile=/opt/vproject-bot/.env
+
+Environment="PATH=/opt/vproject-bot/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+
+# Main process
+ExecStart=/usr/bin/node /opt/vproject-bot/src/index.js
+
+# Auto-restart on failure
+Restart=always
+RestartSec=10
+
+# Give Node time to flush data on SIGTERM
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vproject-bot
+
+# Resource limits
+MemoryLimit=512M
+CPUQuota=80%
+
+# Security
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

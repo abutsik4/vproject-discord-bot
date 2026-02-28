@@ -1,0 +1,44 @@
+{
+  "ownerId": "000000000000000000",
+  "branding": {
+    "name": "VPROJECT",
+    "phase": "OBT",
+    "presence": "VPROJECT • OBT",
+    "panelTitle": "VPROJECT Bot Panel",
+    "panelHeaderTitle": "VPROJECT | GTA5RP RAGE:MP",
+    "panelHeaderSubtitle": "Bot Control Panel (OBT)",
+    "panelOverviewSubtitle": "Simple control panel for VPROJECT Discord bot.",
+    "alertPrefix": "VPROJECT bot"
+  },
+  "webui": {
+    "requireAuth": true,
+    "authToken": ""
+  },
+  "brandColor": 44799,
+  "footerText": "VPROJECT • OBT",
+  "footerIcon": "",
+  "welcome": {
+    "enabled": true,
+    "channelId": "000000000000000000",
+    "message": "Добро пожаловать на **VPROJECT** — GTA 5 RAGE:MP!\nПрочитай правила, выбери роль и заходи на сервер.",
+    "autoRoleIds": []
+  },
+  "logs": {
+    "enabled": true,
+    "channelId": "000000000000000000"
+  },
+  "moderation": {
+    "autoModEnabled": true,
+    "deleteInvites": true,
+    "capsFilter": false
+  },
+  "levels": {
+    "enabled": false,
+    "levelUpChannelId": null
+  },
+  "giveaways": {
+    "defaultDuration": "1h",
+    "defaultWinners": 1,
+    "defaultEmoji": "🎉"
+  }
+}

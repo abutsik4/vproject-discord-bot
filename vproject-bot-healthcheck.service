@@ -1,0 +1,11 @@
+[Unit]
+Description=VPROJECT Bot web healthcheck
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=jepsen
+WorkingDirectory=/opt/vproject-bot
+EnvironmentFile=/opt/vproject-bot/.env
+ExecStart=/opt/vproject-bot/scripts/vproject-healthcheck.sh
