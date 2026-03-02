@@ -18,7 +18,9 @@ const { sendTelegram } = require('./utils/telegram');
 const {
   PACK_CHOICES,
   getGuildConfig,
+  getRecruitmentWorkflowPolicy,
   getRecruitmentStateForGuild,
+  saveRecruitmentWorkflowPolicy,
   saveDefaultSnapshotForGuild,
   setupRecruitmentForGuild,
   assignPackRoleForGuild,
@@ -53,6 +55,7 @@ const ROLE_REQUEST_PACK_ALIASES = {
 };
 const ROLE_REQUESTS_FALLBACK_CHANNEL = '📝│запросы-ролей';
 const ROLE_APPROVALS_FALLBACK_CHANNEL = '🔐│одобрение-ролей';
+const WORKFLOW_REQUEST_AUDIENCE_ALL = 'all_members';
 
 // ------------------------------------------------------
 // Helpers: files & escaping
@@ -311,6 +314,30 @@ function memberHasAnyRole(member, roleIds) {
   return roleIds.filter(Boolean).some(roleId => member.roles.cache.has(roleId));
 }
 
+function normaliseRoleNameForMatch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s|()_-]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function findRoleByConfiguredName(guild, configuredName) {
+  const targetRaw = String(configuredName || '').trim();
+  if (!targetRaw) return null;
+
+  const exact = guild.roles.cache.find(r => r.name === targetRaw) || null;
+  if (exact) return exact;
+
+  const target = normaliseRoleNameForMatch(targetRaw);
+  if (!target) return null;
+
+  return guild.roles.cache.find(role => {
+    const roleName = normaliseRoleNameForMatch(role.name);
+    return roleName === target || roleName.includes(target);
+  }) || null;
+}
+
 function getRoleRequestsForGuild(guildId) {
   const payload = loadRoleRequests();
   payload.guilds[guildId] = payload.guilds[guildId] || [];
@@ -322,15 +349,25 @@ async function resolveRecruitmentWorkflowContext(guild) {
   await guild.channels.fetch();
 
   const cfg = getGuildConfig(guild.id);
+  const workflow = getRecruitmentWorkflowPolicy(guild.id);
   const state = getRecruitmentStateForGuild(guild.id) || {};
 
   const roleByName = name => guild.roles.cache.find(r => r.name === name) || null;
+  const roleById = id => (id ? guild.roles.cache.get(id) || null : null);
   const roles = {
     adminFull: roleByName(cfg.roles && cfg.roles.adminFull),
     adminMod: roleByName(cfg.roles && cfg.roles.adminMod),
     leaderRecruitment: roleByName(cfg.roles && cfg.roles.leaderRecruitment),
-    deputyRecruitment: roleByName(cfg.roles && cfg.roles.deputyRecruitment)
+    deputyRecruitment: roleByName(cfg.roles && cfg.roles.deputyRecruitment),
+    memberBase: roleByName(cfg.roles && cfg.roles.memberBase)
   };
+
+  const workflowApproverRolesByName = (workflow.approverRoleNames || [])
+    .map(roleName => findRoleByConfiguredName(guild, roleName))
+    .filter(Boolean);
+  const workflowApproverRolesById = (workflow.approverRoleIds || [])
+    .map(roleId => roleById(roleId))
+    .filter(Boolean);
 
   const roleRequestsChannelName = (cfg.channels && cfg.channels.roleRequests) || ROLE_REQUESTS_FALLBACK_CHANNEL;
   const approvalsChannelName = (cfg.channels && cfg.channels.approvals) || ROLE_APPROVALS_FALLBACK_CHANNEL;
@@ -346,8 +383,11 @@ async function resolveRecruitmentWorkflowContext(guild) {
 
   return {
     cfg,
+    workflow,
     state,
     roles,
+    workflowApproverRolesByName,
+    workflowApproverRolesById,
     roleRequestsChannel,
     approvalsChannel,
     roleRequestsChannelName,
@@ -355,18 +395,30 @@ async function resolveRecruitmentWorkflowContext(guild) {
   };
 }
 
+function getWorkflowApproverRoleIds(context) {
+  return [...new Set([
+    context.roles.adminFull && context.roles.adminFull.id,
+    context.roles.adminMod && context.roles.adminMod.id,
+    ...(context.workflowApproverRolesByName || []).map(role => role.id),
+    ...(context.workflowApproverRolesById || []).map(role => role.id)
+  ].filter(Boolean))];
+}
+
 async function createRecruitmentRoleRequest(guild, requestedByUserId, targetUserId, pack, reason, sourceTag = 'discord') {
   const context = await resolveRecruitmentWorkflowContext(guild);
   const requester = await guild.members.fetch(requestedByUserId);
 
-  const canRequest = memberHasAnyRole(requester, [
-    context.roles.leaderRecruitment && context.roles.leaderRecruitment.id,
-    context.roles.deputyRecruitment && context.roles.deputyRecruitment.id,
-    context.roles.adminFull && context.roles.adminFull.id,
-    context.roles.adminMod && context.roles.adminMod.id
-  ]);
+  const canRequest = context.workflow.requestAudience === WORKFLOW_REQUEST_AUDIENCE_ALL
+    ? true
+    : memberHasAnyRole(requester, [
+      context.roles.leaderRecruitment && context.roles.leaderRecruitment.id,
+      context.roles.deputyRecruitment && context.roles.deputyRecruitment.id,
+      context.roles.adminFull && context.roles.adminFull.id,
+      context.roles.adminMod && context.roles.adminMod.id,
+      context.roles.memberBase && context.roles.memberBase.id
+    ]);
   if (!canRequest) {
-    throw new Error('Только лидер/зам/админ может создавать запрос на роль.');
+    throw new Error('У вас нет прав на создание запроса роли.');
   }
 
   if (!ROLE_REQUESTABLE_PACKS.includes(pack)) {
@@ -405,12 +457,9 @@ async function createRecruitmentRoleRequest(guild, requestedByUserId, targetUser
 async function decideRecruitmentRoleRequest(guild, requestId, action, approverUserId, decisionReason = '') {
   const context = await resolveRecruitmentWorkflowContext(guild);
   const approver = await guild.members.fetch(approverUserId);
-  const canDecide = memberHasAnyRole(approver, [
-    context.roles.adminFull && context.roles.adminFull.id,
-    context.roles.adminMod && context.roles.adminMod.id
-  ]);
+  const canDecide = memberHasAnyRole(approver, getWorkflowApproverRoleIds(context));
   if (!canDecide) {
-    throw new Error('Решение может принимать только администратор.');
+    throw new Error('Решение может принимать только одобряющая роль (админ/модератор).');
   }
 
   const { payload, list } = getRoleRequestsForGuild(guild.id);
@@ -2796,6 +2845,7 @@ app.get('/recruitment', async (req, res) => {
     await guild.members.fetch({ limit: 1000 });
 
     const cfg = getGuildConfig(guild.id);
+    const workflow = getRecruitmentWorkflowPolicy(guild.id);
     const state = getRecruitmentStateForGuild(guild.id);
     const members = guild.members.cache
       .filter(m => !m.user.bot)
@@ -2808,6 +2858,15 @@ app.get('/recruitment', async (req, res) => {
     const packOptions = Object.keys(PACK_CHOICES)
       .map(value => `<option value="${value}">${escapeHtml(value)}</option>`)
       .join('\n');
+
+    const workflowAudienceLabel = workflow.requestAudience === WORKFLOW_REQUEST_AUDIENCE_ALL
+      ? 'All guild members'
+      : 'Staff-only';
+    const workflowVisibilityLabel = workflow.categoryVisibility === 'restricted'
+      ? 'Restricted'
+      : 'Public';
+    const approverNamesValue = (workflow.approverRoleNames || []).join(', ');
+    const approverIdsValue = (workflow.approverRoleIds || []).join(', ');
 
     const stateSummary = state
       ? `Category ID: ${escapeHtml(state.categoryId || '—')}<br/>Announcement Channel ID: ${escapeHtml(state.announcementChannelId || '—')}<br/>Role Requests Channel ID: ${escapeHtml(state.roleRequestsChannelId || '—')}<br/>Approvals Channel ID: ${escapeHtml(state.approvalsChannelId || '—')}<br/>Last Updated: ${escapeHtml(state.updatedAt || '—')}`
@@ -2892,11 +2951,58 @@ app.get('/recruitment', async (req, res) => {
         </div>
 
         <div class="glass-card" style="margin-top:14px;">
+          <h2 style="margin-top:0;font-size:1rem;">Role Request Workflow Policy</h2>
+          <div class="hint">Current audience: <strong>${escapeHtml(workflowAudienceLabel)}</strong></div>
+          <div class="hint">Category visibility: <strong>${escapeHtml(workflowVisibilityLabel)}</strong></div>
+          <div class="hint">Approvers (names): <strong>${escapeHtml(approverNamesValue || '—')}</strong></div>
+
+          <form id="recruitmentPolicyForm" style="margin-top:12px;">
+            <label>
+              Request audience
+              <select name="requestAudience">
+                <option value="all_members" ${workflow.requestAudience === 'all_members' ? 'selected' : ''}>All guild members</option>
+                <option value="staff_only" ${workflow.requestAudience === 'staff_only' ? 'selected' : ''}>Staff only (leader/deputy/admin/member base)</option>
+              </select>
+            </label>
+
+            <label>
+              Category visibility
+              <select name="categoryVisibility">
+                <option value="public" ${workflow.categoryVisibility === 'public' ? 'selected' : ''}>Public</option>
+                <option value="restricted" ${workflow.categoryVisibility === 'restricted' ? 'selected' : ''}>Restricted</option>
+              </select>
+            </label>
+
+            <label>
+              Approver role names (comma-separated)
+              <input type="text" name="approverRoleNames" value="${escapeHtml(approverNamesValue)}" placeholder="P| Admin (Full), P| Admin (Mod), Модератор Discord" />
+            </label>
+
+            <label>
+              Approver role IDs (comma-separated, optional)
+              <input type="text" name="approverRoleIds" value="${escapeHtml(approverIdsValue)}" placeholder="123..., 456..." />
+            </label>
+
+            <label class="switch-row">
+              <span>Apply setup after save</span>
+              <label class="switch">
+                <input type="checkbox" name="applySetup" checked />
+                <span class="slider"></span>
+              </label>
+            </label>
+
+            <div class="btn-row">
+              <button type="submit" class="primary">Save policy</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="glass-card" style="margin-top:14px;">
           <h2 style="margin-top:0;font-size:1rem;">Запросы ролей через Discord</h2>
           <div class="hint">Создание запросов: <strong>#${escapeHtml((cfg.channels && cfg.channels.roleRequests) || ROLE_REQUESTS_FALLBACK_CHANNEL)}</strong></div>
-          <div class="hint">Одобрение админами: <strong>#${escapeHtml((cfg.channels && cfg.channels.approvals) || ROLE_APPROVALS_FALLBACK_CHANNEL)}</strong></div>
-          <div class="hint" style="margin-top:8px;">Команда для лидеров/замов: <strong>!роль &lt;лидер|зам|база&gt; @пользователь причина</strong></div>
-          <div class="hint">Команды для админов: <strong>!одобрить &lt;ID&gt;</strong> и <strong>!отклонить &lt;ID&gt; причина</strong></div>
+          <div class="hint">Одобрение в закрытом канале: <strong>#${escapeHtml((cfg.channels && cfg.channels.approvals) || ROLE_APPROVALS_FALLBACK_CHANNEL)}</strong></div>
+          <div class="hint" style="margin-top:8px;">Команда для запроса: <strong>!роль &lt;лидер|зам|база&gt; @пользователь причина</strong></div>
+          <div class="hint">Команды для одобряющих ролей: <strong>!одобрить &lt;ID&gt;</strong> и <strong>!отклонить &lt;ID&gt; причина</strong></div>
         </div>
       </section>
     `;
@@ -2957,6 +3063,38 @@ app.get('/recruitment', async (req, res) => {
             })
             .catch(function () {
               showToast('Network error while updating default snapshot', true);
+            });
+        });
+      }
+
+      var policyForm = document.getElementById('recruitmentPolicyForm');
+      if (policyForm) {
+        policyForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var fd = new FormData(policyForm);
+
+          fetch('/recruitment/policy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              requestAudience: (fd.get('requestAudience') || '').toString(),
+              categoryVisibility: (fd.get('categoryVisibility') || '').toString(),
+              approverRoleNames: (fd.get('approverRoleNames') || '').toString(),
+              approverRoleIds: (fd.get('approverRoleIds') || '').toString(),
+              applySetup: fd.get('applySetup') === 'on'
+            })
+          })
+            .then(function (res) { return res.json().then(function (data) { return { ok: res.ok, data: data }; }); })
+            .then(function (result) {
+              if (!result.ok) {
+                showToast(result.data.message || 'Policy update failed', true);
+                return;
+              }
+              showToast(result.data.message || 'Policy updated', false);
+              setTimeout(function () { window.location.reload(); }, 700);
+            })
+            .catch(function () {
+              showToast('Network error while updating policy', true);
             });
         });
       }
@@ -3075,6 +3213,68 @@ app.post('/recruitment/snapshot-default', async (req, res) => {
   } catch (err) {
     console.error('Recruitment snapshot update error:', err);
     return res.status(500).json({ ok: false, message: err.message || 'Snapshot update failed.' });
+  }
+});
+
+app.post('/recruitment/policy', async (req, res) => {
+  try {
+    const guildId = process.env.GUILD_ID;
+    if (!guildId) {
+      return res.status(400).json({ ok: false, message: 'GUILD_ID not set.' });
+    }
+
+    const requestAudience = toSingleString(req.body && req.body.requestAudience, '').trim();
+    const categoryVisibility = toSingleString(req.body && req.body.categoryVisibility, '').trim();
+    const approverRoleNames = normaliseStringArray(req.body && req.body.approverRoleNames)
+      .flatMap(item => item.split(','))
+      .map(item => item.trim())
+      .filter(Boolean);
+    const approverRoleIds = normaliseStringArray(req.body && req.body.approverRoleIds)
+      .flatMap(item => item.split(','))
+      .map(item => item.trim())
+      .filter(Boolean);
+    const applySetup = !!(req.body && req.body.applySetup);
+
+    if (!['all_members', 'staff_only'].includes(requestAudience)) {
+      return res.status(400).json({ ok: false, message: 'Invalid request audience.' });
+    }
+
+    if (!['public', 'restricted'].includes(categoryVisibility)) {
+      return res.status(400).json({ ok: false, message: 'Invalid category visibility.' });
+    }
+
+    const badRoleId = approverRoleIds.find(roleId => !isSnowflake(roleId));
+    if (badRoleId) {
+      return res.status(400).json({ ok: false, message: `Invalid role ID in approvers: ${badRoleId}` });
+    }
+
+    const saved = saveRecruitmentWorkflowPolicy(guildId, {
+      requestAudience,
+      categoryVisibility,
+      approverRoleNames,
+      approverRoleIds
+    });
+
+    if (!applySetup) {
+      return res.json({ ok: true, message: 'Workflow policy saved without setup apply.', workflow: saved });
+    }
+
+    const guild = await client.guilds.fetch(guildId);
+    const result = await setupRecruitmentForGuild(
+      guild,
+      `webui:${req.ip || 'unknown'}:policy`,
+      { dryRun: false }
+    );
+
+    return res.json({
+      ok: true,
+      message: `Workflow policy saved and setup applied (${result.changes.length} changes).`,
+      workflow: saved,
+      changes: result.changes
+    });
+  } catch (err) {
+    console.error('Recruitment policy update error:', err);
+    return res.status(500).json({ ok: false, message: err.message || 'Policy update failed.' });
   }
 });
 

@@ -25,6 +25,16 @@
       "memberBase": "P| Member (Base)",
       "optInPing": "🔔 Набор открыт"
     },
+    "workflow": {
+      "requestAudience": "all_members",
+      "categoryVisibility": "public",
+      "approverRoleNames": [
+        "P| Admin (Full)",
+        "P| Admin (Mod)",
+        "Модератор Discord"
+      ],
+      "approverRoleIds": []
+    },
     "pins": {
       "rules": "[RECRUITMENT_RULES_V1]\n📌 Правила раздела набора:\n1) Читайте шаблон перед публикацией.\n2) Запрещены оффтоп и флуд в ленте объявлений.\n3) Для вопросов используйте канал \"💬│вопросы-по-наборам\".\n4) Пингуйте только роль \"🔔 Набор открыт\" при открытом наборе.",
       "template": "[RECRUITMENT_TEMPLATE_V1]\n📝 Шаблон объявления:\n• Подразделение:\n• Требования:\n• Время набора (МСК):\n• Куда писать/ссылка:\n• Дополнительно:\n\nУпоминание разрешено только для роли \"🔔 Набор открыт\"."

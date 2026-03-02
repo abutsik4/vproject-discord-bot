@@ -65,6 +65,7 @@ async function main() {
   await checkHtml('/stats', token ? 200 : 401);
   await checkHtml('/embeds', token ? 200 : 401);
   await checkHtml('/auto-roles', token ? 200 : 401);
+  await checkHtml('/recruitment', token ? 200 : 401);
 
   await checkPost(
     '/send-embed',
@@ -83,6 +84,18 @@ async function main() {
       enabled: true,
       inviteCode: ['not valid code!'],
       inviteRole: ['123456789012345678']
+    },
+    token ? 400 : 401
+  );
+
+  await checkPost(
+    '/recruitment/policy',
+    {
+      requestAudience: 'invalid_mode',
+      categoryVisibility: 'public',
+      approverRoleNames: 'P| Admin (Full), Модератор Discord',
+      approverRoleIds: '',
+      applySetup: false
     },
     token ? 400 : 401
   );

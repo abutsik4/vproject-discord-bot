@@ -27,6 +27,48 @@ const PACK_GLOBAL_PERMISSIONS = {
   memberBase: []
 };
 
+const WORKFLOW_REQUEST_AUDIENCES = new Set(['all_members', 'staff_only']);
+const WORKFLOW_CATEGORY_VISIBILITY = new Set(['public', 'restricted']);
+
+function normaliseRoleStringArray(value) {
+  if (Array.isArray(value)) {
+    return value.map(v => String(v || '').trim()).filter(Boolean);
+  }
+  if (value == null) return [];
+  return String(value)
+    .split(',')
+    .map(v => v.trim())
+    .filter(Boolean);
+}
+
+function normaliseWorkflowPolicy(rawWorkflow, cfgRoles = {}) {
+  const workflow = rawWorkflow && typeof rawWorkflow === 'object' ? rawWorkflow : {};
+  const requestAudience = WORKFLOW_REQUEST_AUDIENCES.has(workflow.requestAudience)
+    ? workflow.requestAudience
+    : 'all_members';
+  const categoryVisibility = WORKFLOW_CATEGORY_VISIBILITY.has(workflow.categoryVisibility)
+    ? workflow.categoryVisibility
+    : 'public';
+
+  const approverRoleNames = normaliseRoleStringArray(workflow.approverRoleNames);
+  const approverRoleIds = normaliseRoleStringArray(workflow.approverRoleIds)
+    .filter(v => /^\d{17,20}$/.test(v));
+
+  const seededApproverNames = new Set([
+    cfgRoles.adminFull,
+    cfgRoles.adminMod,
+    ...approverRoleNames,
+    'Модератор Discord'
+  ].map(v => String(v || '').trim()).filter(Boolean));
+
+  return {
+    requestAudience,
+    categoryVisibility,
+    approverRoleNames: [...seededApproverNames],
+    approverRoleIds
+  };
+}
+
 function ensureJsonFile(filePath, fallbackObject) {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -60,7 +102,7 @@ function saveRawConfig(rawConfig) {
 function getGuildConfig(guildId) {
   const cfg = loadConfig();
   const guildCfg = cfg.guilds[guildId] || {};
-  return {
+  const merged = {
     ...cfg.defaults,
     ...guildCfg,
     channels: {
@@ -76,6 +118,43 @@ function getGuildConfig(guildId) {
       ...(guildCfg.pins || {})
     }
   };
+
+  merged.workflow = normaliseWorkflowPolicy(
+    {
+      ...(cfg.defaults.workflow || {}),
+      ...(guildCfg.workflow || {})
+    },
+    merged.roles || {}
+  );
+
+  return merged;
+}
+
+function getRecruitmentWorkflowPolicy(guildId) {
+  const cfg = getGuildConfig(guildId);
+  return normaliseWorkflowPolicy(cfg.workflow || {}, cfg.roles || {});
+}
+
+function saveRecruitmentWorkflowPolicy(guildId, workflowPatch = {}) {
+  const raw = loadRawConfig();
+  raw.guilds = raw.guilds || {};
+  raw.guilds[guildId] = raw.guilds[guildId] || {};
+
+  const current = getRecruitmentWorkflowPolicy(guildId);
+  const next = normaliseWorkflowPolicy(
+    {
+      ...current,
+      ...(workflowPatch && typeof workflowPatch === 'object' ? workflowPatch : {})
+    },
+    {
+      ...((raw.default && raw.default.roles) || {}),
+      ...((raw.guilds[guildId] && raw.guilds[guildId].roles) || {})
+    }
+  );
+
+  raw.guilds[guildId].workflow = next;
+  saveRawConfig(raw);
+  return next;
 }
 
 function loadState() {
@@ -107,6 +186,30 @@ async function sendOptionalLog(guild, config, text) {
 
 function findChannel(guild, name, type) {
   return guild.channels.cache.find(ch => ch.name === name && ch.type === type) || null;
+}
+
+function normaliseRoleNameForMatch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s|()_-]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function findRoleByConfiguredName(guild, configuredName) {
+  const targetRaw = String(configuredName || '').trim();
+  if (!targetRaw) return null;
+
+  const exact = guild.roles.cache.find(r => r.name === targetRaw) || null;
+  if (exact) return exact;
+
+  const target = normaliseRoleNameForMatch(targetRaw);
+  if (!target) return null;
+
+  return guild.roles.cache.find(role => {
+    const roleName = normaliseRoleNameForMatch(role.name);
+    return roleName === target || roleName.includes(target);
+  }) || null;
 }
 
 async function ensureRole(guild, me, name, permissions, changes, dryRun) {
@@ -326,8 +429,19 @@ async function ensurePinnedMessage(channel, marker, content, changes, dryRun) {
     return;
   }
 
-  const pinned = await channel.messages.fetchPinned();
-  let target = pinned.find(msg => msg.author.id === channel.client.user.id && msg.content.startsWith(marker));
+  const pinnedRaw = channel.messages.fetchPins
+    ? await channel.messages.fetchPins()
+    : await channel.messages.fetchPinned();
+  const pinnedList = (Array.isArray(pinnedRaw)
+    ? pinnedRaw
+    : (pinnedRaw && Array.isArray(pinnedRaw.items))
+      ? pinnedRaw.items
+      : (pinnedRaw && typeof pinnedRaw.values === 'function')
+        ? [...pinnedRaw.values()]
+        : [])
+    .map(item => (item && item.message ? item.message : item))
+    .filter(item => item && item.author && typeof item.content === 'string');
+  let target = pinnedList.find(msg => msg.author.id === channel.client.user.id && msg.content.startsWith(marker));
 
   if (!target) {
     target = await channel.send(desired);
@@ -359,8 +473,15 @@ function validateBotPermissions(guild) {
   return me;
 }
 
-function buildOverwrites(guild, roleMap) {
+function buildOverwrites(guild, roleMap, workflowPolicy, extraRoleMap = {}) {
   const everyone = guild.roles.everyone.id;
+  const canAllMembersRequest = workflowPolicy.requestAudience === 'all_members';
+  const isCategoryPublic = workflowPolicy.categoryVisibility !== 'restricted';
+  const approverRoleIds = new Set([
+    roleMap.adminFull && roleMap.adminFull.id,
+    roleMap.adminMod && roleMap.adminMod.id,
+    ...(Array.isArray(extraRoleMap.approverRoleIds) ? extraRoleMap.approverRoleIds : [])
+  ].filter(Boolean));
 
   const readOnlyBase = {
     id: everyone,
@@ -378,8 +499,8 @@ function buildOverwrites(guild, roleMap) {
     category: [
       {
         id: everyone,
-        allow: [PermissionFlagsBits.ViewChannel],
-        deny: []
+        allow: isCategoryPublic ? [PermissionFlagsBits.ViewChannel] : [],
+        deny: isCategoryPublic ? [] : [PermissionFlagsBits.ViewChannel]
       },
       {
         id: roleMap.adminFull.id,
@@ -509,8 +630,14 @@ function buildOverwrites(guild, roleMap) {
     roleRequests: [
       {
         id: everyone,
-        allow: [],
-        deny: [PermissionFlagsBits.ViewChannel]
+        allow: canAllMembersRequest
+          ? [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory
+          ]
+          : [],
+        deny: canAllMembersRequest ? [] : [PermissionFlagsBits.ViewChannel]
       },
       {
         id: roleMap.adminFull.id,
@@ -553,38 +680,28 @@ function buildOverwrites(guild, roleMap) {
       {
         id: everyone,
         allow: [],
-        deny: [PermissionFlagsBits.ViewChannel]
-      },
-      {
-        id: roleMap.adminFull.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.ManageMessages
-        ],
-        deny: []
-      },
-      {
-        id: roleMap.adminMod.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.ManageMessages
-        ],
-        deny: []
+        deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory]
       },
       {
         id: roleMap.leaderRecruitment.id,
         allow: [],
-        deny: [PermissionFlagsBits.ViewChannel]
+        deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory]
       },
       {
         id: roleMap.deputyRecruitment.id,
         allow: [],
-        deny: [PermissionFlagsBits.ViewChannel]
-      }
+        deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory]
+      },
+      ...[...approverRoleIds].map(roleId => ({
+        id: roleId,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageMessages
+        ],
+        deny: []
+      }))
     ]
   };
 }
@@ -609,6 +726,7 @@ async function setupRecruitmentForGuild(guild, actorTag = 'system', options = {}
   const cfg = getGuildConfig(guild.id);
   const dryRun = options.dryRun === true || cfg.dryRun === true;
   const changes = [];
+  const workflowPolicy = getRecruitmentWorkflowPolicy(guild.id);
 
   const me = validateBotPermissions(guild);
 
@@ -677,7 +795,45 @@ async function setupRecruitmentForGuild(guild, actorTag = 'system', options = {}
     }
   }
 
-  const overwrites = buildOverwrites(guild, roleMap);
+  const approverRolesByName = (workflowPolicy.approverRoleNames || [])
+    .map(name => findRoleByConfiguredName(guild, name))
+    .filter(Boolean);
+  const approverRolesById = (workflowPolicy.approverRoleIds || [])
+    .map(roleId => guild.roles.cache.get(roleId) || null)
+    .filter(Boolean);
+
+  const workflowApproverRoleIds = [...new Set([
+    ...approverRolesByName.map(r => r.id),
+    ...approverRolesById.map(r => r.id)
+  ])];
+
+  if ((workflowPolicy.approverRoleNames || []).length > approverRolesByName.length) {
+    const missingApprovers = (workflowPolicy.approverRoleNames || []).filter(
+      roleName => !approverRolesByName.some(role => role.name === roleName)
+    );
+    if (missingApprovers.length > 0) {
+      logChange(
+        changes,
+        `Approver roles not found by name: ${missingApprovers.join(', ')} (skipping missing roles)`
+      );
+    }
+  }
+
+  if ((workflowPolicy.approverRoleIds || []).length > approverRolesById.length) {
+    const missingApproverIds = (workflowPolicy.approverRoleIds || []).filter(
+      roleId => !approverRolesById.some(role => role.id === roleId)
+    );
+    if (missingApproverIds.length > 0) {
+      logChange(
+        changes,
+        `Approver roles not found by ID: ${missingApproverIds.join(', ')} (skipping missing roles)`
+      );
+    }
+  }
+
+  const overwrites = buildOverwrites(guild, roleMap, workflowPolicy, {
+    approverRoleIds: workflowApproverRoleIds
+  });
   const category = await ensureCategory(
     guild,
     cfg.categoryName,
@@ -796,7 +952,8 @@ async function setupRecruitmentForGuild(guild, actorTag = 'system', options = {}
         leaderRecruitment: roleMap.leaderRecruitment?.id || null,
         deputyRecruitment: roleMap.deputyRecruitment?.id || null,
         memberBase: roleMap.memberBase?.id || null,
-        optInPing: roleMap.optInPing?.id || null
+        optInPing: roleMap.optInPing?.id || null,
+        workflowApprovers: workflowApproverRoleIds
       },
       updatedAt: new Date().toISOString()
     };
@@ -1080,7 +1237,9 @@ async function enforceRecruitmentAnnouncementMessage(message) {
 module.exports = {
   PACK_CHOICES,
   getGuildConfig,
+  getRecruitmentWorkflowPolicy,
   getRecruitmentStateForGuild,
+  saveRecruitmentWorkflowPolicy,
   saveDefaultSnapshotForGuild,
   setupRecruitmentArchitecture,
   setupRecruitmentForGuild,
