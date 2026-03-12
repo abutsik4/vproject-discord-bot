@@ -685,47 +685,69 @@ function buildOverwrites(guild, roleMap, workflowPolicy, extraRoleMap = {}) {
         allow: canAllMembersRequest
           ? [
             PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
             PermissionFlagsBits.ReadMessageHistory
           ]
           : [],
-        deny: canAllMembersRequest ? [] : [PermissionFlagsBits.ViewChannel]
+        deny: canAllMembersRequest
+          ? [
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.AddReactions,
+            PermissionFlagsBits.CreatePublicThreads,
+            PermissionFlagsBits.CreatePrivateThreads
+          ]
+          : [PermissionFlagsBits.ViewChannel]
+      },
+      {
+        id: guild.members.me.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.EmbedLinks,
+          PermissionFlagsBits.ReadMessageHistory
+        ],
+        deny: []
       },
       {
         id: roleMap.adminFull.id,
         allow: [
           PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageMessages
         ],
-        deny: []
+        deny: [
+          PermissionFlagsBits.SendMessages
+        ]
       },
       {
         id: roleMap.adminMod.id,
         allow: [
           PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageMessages
         ],
-        deny: []
+        deny: [
+          PermissionFlagsBits.SendMessages
+        ]
       },
       {
         id: roleMap.leaderRecruitment.id,
         allow: [
           PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
           PermissionFlagsBits.ReadMessageHistory
         ],
-        deny: []
+        deny: [
+          PermissionFlagsBits.SendMessages
+        ]
       },
       {
         id: roleMap.deputyRecruitment.id,
         allow: [
           PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
           PermissionFlagsBits.ReadMessageHistory
         ],
-        deny: []
+        deny: [
+          PermissionFlagsBits.SendMessages
+        ]
       }
     ],
     approvals: [
@@ -1106,6 +1128,15 @@ function getRecruitmentStateForGuild(guildId) {
   return (state.guilds && state.guilds[guildId]) || null;
 }
 
+function saveRecruitmentStateForGuild(guildId, patch) {
+  const state = loadState();
+  state.guilds = state.guilds || {};
+  state.guilds[guildId] = state.guilds[guildId] || {};
+  Object.assign(state.guilds[guildId], patch);
+  state.guilds[guildId].updatedAt = new Date().toISOString();
+  saveState(state);
+}
+
 function stripMarkerPrefix(content, marker) {
   const text = String(content || '').trim();
   if (text.startsWith(`${marker}\n`)) {
@@ -1292,6 +1323,7 @@ module.exports = {
   getRecruitmentMessageTemplates,
   getRecruitmentWorkflowPolicy,
   getRecruitmentStateForGuild,
+  saveRecruitmentStateForGuild,
   saveRecruitmentWorkflowPolicy,
   saveRecruitmentMessageTemplates,
   saveDefaultSnapshotForGuild,

@@ -4,7 +4,16 @@ const {
   Client,
   GatewayIntentBits,
   Events,
-  ChannelType
+  ChannelType,
+  ButtonBuilder,
+  ButtonStyle,
+  ActionRowBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  EmbedBuilder,
+  ComponentType,
+  SlashCommandBuilder
 } = require('discord.js');
 
 const fs = require('node:fs');
@@ -21,6 +30,7 @@ const {
   getRecruitmentMessageTemplates,
   getRecruitmentWorkflowPolicy,
   getRecruitmentStateForGuild,
+  saveRecruitmentStateForGuild,
   saveRecruitmentWorkflowPolicy,
   saveRecruitmentMessageTemplates,
   saveDefaultSnapshotForGuild,
@@ -47,7 +57,7 @@ const ROLE_REQUESTABLE_PACKS = ['leader_recruitment', 'deputy_recruitment', 'mem
 const ROLE_REQUEST_PACK_LABELS = {
   leader_recruitment: 'Лидер',
   deputy_recruitment: 'Заместитель',
-  member_base: 'База'
+  member_base: 'Участник'
 };
 const ROLE_REQUEST_PACK_ALIASES = {
   'leader_recruitment': 'leader_recruitment',
@@ -57,6 +67,7 @@ const ROLE_REQUEST_PACK_ALIASES = {
   'зам': 'deputy_recruitment',
   'deputy': 'deputy_recruitment',
   'member_base': 'member_base',
+  'участник': 'member_base',
   'база': 'member_base',
   'member': 'member_base'
 };
@@ -122,8 +133,32 @@ function renderTemplate(template, vars) {
   });
 }
 
+const ROLE_REQUEST_PACK_DESCRIPTIONS_DEFAULT = {
+  leader_recruitment: 'руководство подразделением набора',
+  deputy_recruitment: 'помощник лидера набора',
+  member_base: 'участник подразделения набора'
+};
+
 function getRoleRequestPackLabel(pack) {
+  const guildId = process.env.GUILD_ID;
+  if (guildId) {
+    const state = getRecruitmentStateForGuild(guildId);
+    if (state && state.roleRequestButtonLabels && state.roleRequestButtonLabels[pack]) {
+      return state.roleRequestButtonLabels[pack];
+    }
+  }
   return ROLE_REQUEST_PACK_LABELS[pack] || pack || '—';
+}
+
+function getRoleRequestPackDescription(pack) {
+  const guildId = process.env.GUILD_ID;
+  if (guildId) {
+    const state = getRecruitmentStateForGuild(guildId);
+    if (state && state.roleRequestButtonDescriptions && state.roleRequestButtonDescriptions[pack]) {
+      return state.roleRequestButtonDescriptions[pack];
+    }
+  }
+  return ROLE_REQUEST_PACK_DESCRIPTIONS_DEFAULT[pack] || '';
 }
 
 function buildRoleRequestTemplateVars(entry, context, extra = {}) {
@@ -491,7 +526,15 @@ async function createRecruitmentRoleRequest(guild, requestedByUserId, targetUser
     throw new Error('Недопустимый пакет роли для запроса.');
   }
 
+  // Duplicate prevention: check for existing pending request with same target + pack
   const { payload, list } = getRoleRequestsForGuild(guild.id);
+  const duplicate = list.find(
+    r => r.status === 'pending' && r.targetUserId === targetUserId && r.pack === pack
+  );
+  if (duplicate) {
+    throw new Error(`Уже существует активный запрос на роль "${getRoleRequestPackLabel(pack)}" для этого пользователя (ID: ${duplicate.id.slice(0, 8)}…).`);
+  }
+
   const requestId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
   const entry = {
@@ -505,20 +548,56 @@ async function createRecruitmentRoleRequest(guild, requestedByUserId, targetUser
     createdAt: new Date().toISOString(),
     decidedAt: null,
     decidedByUserId: null,
-    decisionReason: ''
+    decisionReason: '',
+    approvalMessageId: null
   };
 
   list.push(entry);
   saveRoleRequests(payload);
 
-  const templates = getRecruitmentMessageTemplates(guild.id);
-  const marker = `||[ROLE_REQUEST:${entry.id}]||`;
-
+  // Send rich embed with Approve/Deny buttons to the approvals channel
   if (context.approvalsChannel) {
-    const vars = buildRoleRequestTemplateVars(entry, context);
-    const messageText = renderTemplate(templates.approvalsCreatedPost, vars).trim();
-    await context.approvalsChannel.send(`${marker} ${messageText}`.trim());
+    const approvalEmbed = new EmbedBuilder()
+      .setTitle('📋 Новый запрос на роль')
+      .setColor(config.brandColor || 0x2b2d31)
+      .addFields(
+        { name: '👤 Запрашивающий', value: `<@${entry.requestedByUserId}>`, inline: true },
+        { name: '🎯 Целевой пользователь', value: `<@${entry.targetUserId}>`, inline: true },
+        { name: '🛡️ Роль', value: getRoleRequestPackLabel(entry.pack), inline: true },
+        { name: '📝 Причина', value: entry.reason || '—', inline: false },
+        { name: '🔖 ID запроса', value: `\`${entry.id.slice(0, 8)}…\``, inline: true },
+        { name: '📅 Дата', value: `<t:${Math.floor(new Date(entry.createdAt).getTime() / 1000)}:f>`, inline: true }
+      )
+      .setFooter({ text: `ID: ${entry.id}` })
+      .setTimestamp();
+
+    const approveBtn = new ButtonBuilder()
+      .setCustomId(`approve_role_request_${entry.id}`)
+      .setLabel('✅ Одобрить')
+      .setStyle(ButtonStyle.Success);
+
+    const denyBtn = new ButtonBuilder()
+      .setCustomId(`deny_role_request_${entry.id}`)
+      .setLabel('❌ Отклонить')
+      .setStyle(ButtonStyle.Danger);
+
+    const row = new ActionRowBuilder().addComponents(approveBtn, denyBtn);
+
+    const approvalMsg = await context.approvalsChannel.send({ embeds: [approvalEmbed], components: [row] });
+
+    // Store approval message ID for later editing
+    entry.approvalMessageId = approvalMsg.id;
+    saveRoleRequests(payload);
   }
+
+  // Send audit log
+  await sendAuditLog(guild, '📋 Создан запрос на роль', [
+    { name: 'Запрашивающий', value: `<@${entry.requestedByUserId}>`, inline: true },
+    { name: 'Целевой', value: `<@${entry.targetUserId}>`, inline: true },
+    { name: 'Роль', value: getRoleRequestPackLabel(entry.pack), inline: true },
+    { name: 'Причина', value: entry.reason || '—', inline: false },
+    { name: 'ID', value: `\`${entry.id}\``, inline: false }
+  ], 0x3498db);
 
   return { entry, context };
 }
@@ -558,19 +637,69 @@ async function decideRecruitmentRoleRequest(guild, requestId, action, approverUs
   entry.decisionReason = String(decisionReason || '').trim();
   saveRoleRequests(payload);
 
-  const templates = getRecruitmentMessageTemplates(guild.id);
-  const marker = `||[ROLE_REQUEST:${entry.id}]||`;
-  const vars = buildRoleRequestTemplateVars(entry, context);
+  // Edit the original approval embed in-place (change color, add footer, disable buttons)
+  if (context.approvalsChannel && entry.approvalMessageId) {
+    try {
+      const approvalMsg = await context.approvalsChannel.messages.fetch(entry.approvalMessageId);
+      if (approvalMsg) {
+        const isApproved = entry.status === 'approved';
+        const updatedEmbed = EmbedBuilder.from(approvalMsg.embeds[0])
+          .setColor(isApproved ? 0x2ecc71 : 0xe74c3c)
+          .setFooter({
+            text: `${isApproved ? '✅ Одобрено' : '❌ Отклонено'} — ${approver.user.tag}${entry.decisionReason ? ` | Причина: ${entry.decisionReason}` : ''} | ID: ${entry.id}`
+          })
+          .setTimestamp(new Date(entry.decidedAt));
 
-  if (context.approvalsChannel) {
-    const messageText = renderTemplate(templates.approvalsDecisionPost, vars).trim();
-    await context.approvalsChannel.send(`${marker} ${messageText}`.trim());
+        // Disable all buttons
+        const disabledRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`approve_role_request_${entry.id}`)
+            .setLabel('✅ Одобрить')
+            .setStyle(ButtonStyle.Success)
+            .setDisabled(true),
+          new ButtonBuilder()
+            .setCustomId(`deny_role_request_${entry.id}`)
+            .setLabel('❌ Отклонить')
+            .setStyle(ButtonStyle.Danger)
+            .setDisabled(true)
+        );
+
+        await approvalMsg.edit({ embeds: [updatedEmbed], components: [disabledRow] });
+      }
+    } catch (err) {
+      console.error('Failed to edit approval message:', err);
+    }
   }
 
+  // Post decision notification in requests channel
   if (context.roleRequestsChannel) {
-    const messageText = renderTemplate(templates.requestsDecisionPost, vars).trim();
-    await context.roleRequestsChannel.send(messageText);
+    const isApproved = entry.status === 'approved';
+    const decisionEmbed = new EmbedBuilder()
+      .setTitle(`${isApproved ? '✅' : '❌'} Запрос ${isApproved ? 'одобрен' : 'отклонён'}`)
+      .setColor(isApproved ? 0x2ecc71 : 0xe74c3c)
+      .addFields(
+        { name: 'Пользователь', value: `<@${entry.targetUserId}>`, inline: true },
+        { name: 'Роль', value: getRoleRequestPackLabel(entry.pack), inline: true },
+        { name: 'Решение принял', value: `<@${approverUserId}>`, inline: true }
+      )
+      .setTimestamp();
+
+    if (entry.decisionReason) {
+      decisionEmbed.addFields({ name: 'Причина', value: entry.decisionReason, inline: false });
+    }
+
+    await context.roleRequestsChannel.send({ embeds: [decisionEmbed] });
   }
+
+  // Send audit log
+  const isApproved = entry.status === 'approved';
+  await sendAuditLog(guild, `${isApproved ? '✅' : '❌'} Запрос ${isApproved ? 'одобрен' : 'отклонён'}`, [
+    { name: 'Целевой', value: `<@${entry.targetUserId}>`, inline: true },
+    { name: 'Роль', value: getRoleRequestPackLabel(entry.pack), inline: true },
+    { name: 'Решение', value: `<@${approverUserId}>`, inline: true },
+    { name: 'Причина', value: entry.decisionReason || '—', inline: false },
+    { name: 'ID', value: `\`${entry.id}\``, inline: false }
+  ], isApproved ? 0x2ecc71 : 0xe74c3c);
 
   return entry;
 }
@@ -597,7 +726,7 @@ async function handleRecruitmentRoleRequestMessage(message) {
     const pack = resolveRoleRequestPack(parts[1]);
     const mentionedMember = message.mentions.members && message.mentions.members.first();
     if (!pack || !mentionedMember) {
-      await message.reply('Формат: `!роль <лидер|зам|база> @пользователь <причина>` (также поддерживается `:роль`)');
+      await message.reply('Формат: `!роль <лидер|зам|участник> @пользователь <причина>` (также поддерживается `:роль`)');
       return true;
     }
 
@@ -618,7 +747,7 @@ async function handleRecruitmentRoleRequestMessage(message) {
       const templates = getRecruitmentMessageTemplates(message.guild.id);
       const vars = buildRoleRequestTemplateVars(result.entry, result.context);
       const replyText = renderTemplate(templates.requesterCreatedReply, vars).trim();
-      await message.reply(replyText || 'Запрос создан.');
+      await message.reply(`⚠️ Текстовые команды устарели. Используйте кнопки в канале запросов.\n\n${replyText || 'Запрос создан.'}`);
     } catch (err) {
       await message.reply(err.message || 'Не удалось создать запрос.');
     }
@@ -664,7 +793,7 @@ async function handleRecruitmentRoleRequestMessage(message) {
         message.author.id,
         decisionReason
       );
-      await message.reply(`Запрос ${requestId} ${isApprove ? 'одобрен' : 'отклонен'}.`);
+      await message.reply(`⚠️ Текстовые команды устарели. Используйте кнопки одобрения на запросе.\n\nЗапрос ${requestId} ${isApprove ? 'одобрен' : 'отклонен'}.`);
     } catch (err) {
       await message.reply(err.message || 'Не удалось обработать запрос.');
     }
@@ -673,6 +802,587 @@ async function handleRecruitmentRoleRequestMessage(message) {
   }
 
   return false;
+}
+
+// ------------------------------------------------------
+// Audit log helper
+// ------------------------------------------------------
+
+async function sendAuditLog(guild, title, fields, color = 0x3498db) {
+  try {
+    const archConfig = getGuildConfig(guild.id);
+    const logChannelId = archConfig.logChannelId || (config.logs && config.logs.channelId);
+    if (!logChannelId) return;
+    const logChannel = guild.channels.cache.get(logChannelId);
+    if (!logChannel) return;
+    const embed = new EmbedBuilder()
+      .setTitle(title)
+      .setColor(color)
+      .setTimestamp();
+    if (fields && fields.length) embed.addFields(fields);
+    await logChannel.send({ embeds: [embed] });
+  } catch (err) {
+    console.error('[AuditLog] Failed to send audit log:', err.message);
+  }
+}
+
+// ------------------------------------------------------
+// Role Request Panel (persistent embed with buttons)
+// ------------------------------------------------------
+
+const ROLE_REQUEST_PANEL_PACK_EMOJIS = {
+  leader_recruitment: '',
+  deputy_recruitment: '',
+  member_base: ''
+};
+
+function buildRoleRequestPanelEmbed() {
+  const roleLines = ROLE_REQUESTABLE_PACKS.map(pack => {
+    const label = getRoleRequestPackLabel(pack);
+    const desc = getRoleRequestPackDescription(pack);
+    return desc ? `**${label}** — ${desc}` : `**${label}**`;
+  }).join('\n');
+
+  const embed = new EmbedBuilder()
+    .setTitle('Запросы на роли')
+    .setDescription(
+      'Для получения роли в разделе набора нажмите на одну из кнопок ниже.\n\n' +
+      '**Доступные роли:**\n\n' +
+      roleLines + '\n\n' +
+      'После нажатия откроется форма: укажите пользователя и причину запроса.\n' +
+      'Минимальная длина причины — 10 символов.\n\n' +
+      'Статус запроса будет отображён в этом канале после рассмотрения.'
+    )
+    .setColor(config.brandColor || 0x2b2d31)
+    .setFooter({ text: `${BRAND_NAME} · Система запросов ролей` });
+  return embed;
+}
+
+function buildRoleRequestPanelButtons() {
+  const buttons = ROLE_REQUESTABLE_PACKS.map(pack => {
+    const label = getRoleRequestPackLabel(pack);
+    return new ButtonBuilder()
+      .setCustomId(`role_request_panel_${pack}`)
+      .setLabel(label)
+      .setStyle(ButtonStyle.Primary);
+  });
+  return new ActionRowBuilder().addComponents(buttons);
+}
+
+async function sendRoleRequestPanel(channel) {
+  const embed = buildRoleRequestPanelEmbed();
+  const row = buildRoleRequestPanelButtons();
+  const msg = await channel.send({ embeds: [embed], components: [row] });
+  return msg;
+}
+
+async function ensureRoleRequestPanel(guild) {
+  const context = await resolveRecruitmentWorkflowContext(guild);
+  if (!context.roleRequestsChannel) return null;
+
+  const state = getRecruitmentStateForGuild(guild.id) || {};
+  const existingMsgId = state.roleRequestPanelMessageId;
+
+  // Check if the panel message still exists
+  if (existingMsgId) {
+    try {
+      const existing = await context.roleRequestsChannel.messages.fetch(existingMsgId);
+      if (existing) return existing; // panel exists, nothing to do
+    } catch {
+      // message was deleted or not found — re-send
+    }
+  }
+
+  // Send a new panel
+  const msg = await sendRoleRequestPanel(context.roleRequestsChannel);
+  saveRecruitmentStateForGuild(guild.id, { roleRequestPanelMessageId: msg.id });
+  console.log(`[RoleRequests] Panel sent in #${context.roleRequestsChannel.name} (${msg.id})`);
+  return msg;
+}
+
+// Lock down #запросы-ролей so only the bot can send messages
+async function lockdownRoleRequestsChannel(guild) {
+  const context = await resolveRecruitmentWorkflowContext(guild);
+  const channel = context.roleRequestsChannel;
+  if (!channel) return;
+
+  const { PermissionFlagsBits } = require('discord.js');
+  const botMember = guild.members.me;
+  const everyone = guild.roles.everyone;
+
+  try {
+    // Deny SendMessages for @everyone
+    await channel.permissionOverwrites.edit(everyone, {
+      ViewChannel: true,
+      SendMessages: false,
+      AddReactions: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      ReadMessageHistory: true
+    }, { reason: 'Role requests: button-only mode — no user messages' });
+
+    // Allow SendMessages for the bot itself
+    await channel.permissionOverwrites.edit(botMember, {
+      ViewChannel: true,
+      SendMessages: true,
+      EmbedLinks: true,
+      ReadMessageHistory: true
+    }, { reason: 'Role requests: bot needs to post panel & notifications' });
+
+    // Deny SendMessages for staff roles too (they use buttons in approvals channel)
+    const staffRoles = [
+      context.roles.adminFull,
+      context.roles.adminMod,
+      context.roles.leaderRecruitment,
+      context.roles.deputyRecruitment
+    ].filter(Boolean);
+
+    for (const role of staffRoles) {
+      await channel.permissionOverwrites.edit(role, {
+        ViewChannel: true,
+        SendMessages: false,
+        ReadMessageHistory: true
+      }, { reason: 'Role requests: button-only mode — no user messages' });
+    }
+
+    console.log(`[RoleRequests] Channel #${channel.name} locked down — bot-only send permission.`);
+  } catch (err) {
+    console.error('[RoleRequests] Failed to lock down channel:', err.message);
+  }
+}
+
+// ------------------------------------------------------
+// Button & Modal Interaction Handlers
+// ------------------------------------------------------
+
+async function handleRoleRequestPanelButton(interaction) {
+  // customId format: role_request_panel_<pack>
+  const pack = interaction.customId.replace('role_request_panel_', '');
+  if (!ROLE_REQUESTABLE_PACKS.includes(pack)) {
+    return interaction.reply({ content: '❌ Неизвестный тип роли.', ephemeral: true });
+  }
+
+  const label = getRoleRequestPackLabel(pack);
+
+  const modal = new ModalBuilder()
+    .setCustomId(`role_request_modal_${pack}`)
+    .setTitle(`Запрос роли: ${label}`);
+
+  const targetInput = new TextInputBuilder()
+    .setCustomId('target_user')
+    .setLabel('ID или @упоминание пользователя')
+    .setPlaceholder('Например: 123456789012345678 или @Имя')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMinLength(1)
+    .setMaxLength(50);
+
+  const reasonInput = new TextInputBuilder()
+    .setCustomId('reason')
+    .setLabel('Причина запроса (мин. 10 символов)')
+    .setPlaceholder('Укажите, почему этот пользователь должен получить роль...')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMinLength(10)
+    .setMaxLength(1000);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(targetInput),
+    new ActionRowBuilder().addComponents(reasonInput)
+  );
+
+  await interaction.showModal(modal);
+}
+
+async function handleRoleRequestModalSubmit(interaction) {
+  // customId format: role_request_modal_<pack>
+  const pack = interaction.customId.replace('role_request_modal_', '');
+  if (!ROLE_REQUESTABLE_PACKS.includes(pack)) {
+    return interaction.reply({ content: '❌ Неизвестный тип роли.', ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const rawTarget = interaction.fields.getTextInputValue('target_user').trim();
+  const reason = interaction.fields.getTextInputValue('reason').trim();
+
+  // Parse target user ID from mention format <@ID> or <@!ID> or raw snowflake
+  let targetUserId = rawTarget.replace(/[<@!>]/g, '').trim();
+
+  // Validate it's a snowflake
+  if (!/^\d{17,20}$/.test(targetUserId)) {
+    return interaction.editReply({ content: '❌ Неверный формат пользователя. Укажите ID (число) или @упоминание.' });
+  }
+
+  // Verify user exists in the guild
+  let targetMember;
+  try {
+    targetMember = await interaction.guild.members.fetch(targetUserId);
+  } catch {
+    return interaction.editReply({ content: '❌ Пользователь не найден на сервере.' });
+  }
+
+  try {
+    const result = await createRecruitmentRoleRequest(
+      interaction.guild,
+      interaction.user.id,
+      targetUserId,
+      pack,
+      reason,
+      'discord-button'
+    );
+
+    await interaction.editReply({
+      content: `✅ Запрос создан!\n\n**Роль:** ${getRoleRequestPackLabel(pack)}\n**Пользователь:** <@${targetUserId}>\n**ID запроса:** \`${result.entry.id.slice(0, 8)}…\`\n\nОжидайте решение администратора.`
+    });
+  } catch (err) {
+    await interaction.editReply({ content: `❌ ${err.message}` });
+  }
+}
+
+async function handleApproveButton(interaction) {
+  // customId format: approve_role_request_<requestId>
+  const requestId = interaction.customId.replace('approve_role_request_', '');
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    const entry = await decideRecruitmentRoleRequest(
+      interaction.guild,
+      requestId,
+      'approve',
+      interaction.user.id,
+      ''
+    );
+    await interaction.editReply({
+      content: `✅ Запрос одобрен. Роль **${getRoleRequestPackLabel(entry.pack)}** выдана пользователю <@${entry.targetUserId}>.`
+    });
+  } catch (err) {
+    await interaction.editReply({ content: `❌ ${err.message}` });
+  }
+}
+
+async function handleDenyButton(interaction) {
+  // customId format: deny_role_request_<requestId>
+  const requestId = interaction.customId.replace('deny_role_request_', '');
+
+  // Verify the request still exists and is pending before showing modal
+  const { list } = getRoleRequestsForGuild(interaction.guild.id);
+  const entry = list.find(r => r.id === requestId);
+  if (!entry || entry.status !== 'pending') {
+    return interaction.reply({ content: '❌ Запрос уже обработан или не найден.', ephemeral: true });
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`deny_reason_modal_${requestId}`)
+    .setTitle('Отклонение запроса');
+
+  const reasonInput = new TextInputBuilder()
+    .setCustomId('deny_reason')
+    .setLabel('Причина отклонения (необязательно)')
+    .setPlaceholder('Укажите причину отклонения...')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setMaxLength(500);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+
+  await interaction.showModal(modal);
+}
+
+async function handleDenyReasonModalSubmit(interaction) {
+  // customId format: deny_reason_modal_<requestId>
+  const requestId = interaction.customId.replace('deny_reason_modal_', '');
+  const reason = (interaction.fields.getTextInputValue('deny_reason') || '').trim();
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    const entry = await decideRecruitmentRoleRequest(
+      interaction.guild,
+      requestId,
+      'reject',
+      interaction.user.id,
+      reason
+    );
+    await interaction.editReply({
+      content: `❌ Запрос отклонён для <@${entry.targetUserId}> (${getRoleRequestPackLabel(entry.pack)}).${reason ? `\nПричина: ${reason}` : ''}`
+    });
+  } catch (err) {
+    await interaction.editReply({ content: `❌ ${err.message}` });
+  }
+}
+
+// ------------------------------------------------------
+// /pending_requests slash command handler
+// ------------------------------------------------------
+
+async function handlePendingRequestsCommand(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+
+  const context = await resolveRecruitmentWorkflowContext(interaction.guild);
+  const canView = memberHasAnyRole(interaction.member, getWorkflowApproverRoleIds(context));
+  if (!canView) {
+    return interaction.editReply({ content: '❌ У вас нет прав для просмотра запросов.' });
+  }
+
+  const statusFilter = interaction.options.getString('статус') || 'pending';
+  const { list } = getRoleRequestsForGuild(interaction.guild.id);
+
+  let filtered;
+  if (statusFilter === 'all') {
+    filtered = [...list].reverse();
+  } else {
+    filtered = list.filter(r => r.status === statusFilter).reverse();
+  }
+
+  if (!filtered.length) {
+    const statusLabels = { pending: 'ожидающих', approved: 'одобренных', rejected: 'отклонённых', expired: 'истёкших', all: '' };
+    return interaction.editReply({
+      content: `📭 Нет ${statusLabels[statusFilter] || ''} запросов.`
+    });
+  }
+
+  const PAGE_SIZE = 10;
+  const page = 0;
+  const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+  const pageItems = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  const statusEmojis = { pending: '⏳', approved: '✅', rejected: '❌', expired: '⏰' };
+  const statusLabels = { pending: 'Ожидает', approved: 'Одобрен', rejected: 'Отклонён', expired: 'Истёк' };
+
+  const description = pageItems.map((r, i) => {
+    const idx = page * PAGE_SIZE + i + 1;
+    const emoji = statusEmojis[r.status] || '❓';
+    const label = statusLabels[r.status] || r.status;
+    const date = r.createdAt ? `<t:${Math.floor(new Date(r.createdAt).getTime() / 1000)}:R>` : '—';
+    return `**${idx}.** ${emoji} \`${r.id.slice(0, 8)}…\` — **${getRoleRequestPackLabel(r.pack)}** для <@${r.targetUserId}>\n   ↳ ${label} | ${date} | Автор: <@${r.requestedByUserId}>`;
+  }).join('\n\n');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`📋 Запросы на роли (${filtered.length} шт.)`)
+    .setDescription(description)
+    .setColor(config.brandColor || 0x2b2d31)
+    .setFooter({ text: `Страница ${page + 1}/${totalPages} • Фильтр: ${statusFilter}` })
+    .setTimestamp();
+
+  const components = [];
+  if (totalPages > 1) {
+    const navRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`req_page_${statusFilter}_0`)
+        .setLabel('◀️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(true),
+      new ButtonBuilder()
+        .setCustomId(`req_page_${statusFilter}_1`)
+        .setLabel('▶️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(totalPages <= 1)
+    );
+    components.push(navRow);
+  }
+
+  await interaction.editReply({ embeds: [embed], components });
+}
+
+async function handleRequestPageButton(interaction) {
+  // customId format: req_page_<statusFilter>_<pageNumber>
+  const parts = interaction.customId.split('_');
+  const statusFilter = parts[2];
+  const page = parseInt(parts[3], 10);
+
+  const { list } = getRoleRequestsForGuild(interaction.guild.id);
+  let filtered;
+  if (statusFilter === 'all') {
+    filtered = [...list].reverse();
+  } else {
+    filtered = list.filter(r => r.status === statusFilter).reverse();
+  }
+
+  const PAGE_SIZE = 10;
+  const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+  const pageItems = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  const statusEmojis = { pending: '⏳', approved: '✅', rejected: '❌', expired: '⏰' };
+  const statusLabels = { pending: 'Ожидает', approved: 'Одобрен', rejected: 'Отклонён', expired: 'Истёк' };
+
+  const description = pageItems.map((r, i) => {
+    const idx = page * PAGE_SIZE + i + 1;
+    const emoji = statusEmojis[r.status] || '❓';
+    const label = statusLabels[r.status] || r.status;
+    const date = r.createdAt ? `<t:${Math.floor(new Date(r.createdAt).getTime() / 1000)}:R>` : '—';
+    return `**${idx}.** ${emoji} \`${r.id.slice(0, 8)}…\` — **${getRoleRequestPackLabel(r.pack)}** для <@${r.targetUserId}>\n   ↳ ${label} | ${date} | Автор: <@${r.requestedByUserId}>`;
+  }).join('\n\n');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`📋 Запросы на роли (${filtered.length} шт.)`)
+    .setDescription(description || 'Нет запросов.')
+    .setColor(config.brandColor || 0x2b2d31)
+    .setFooter({ text: `Страница ${page + 1}/${totalPages} • Фильтр: ${statusFilter}` })
+    .setTimestamp();
+
+  const navRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`req_page_${statusFilter}_${page - 1}`)
+      .setLabel('◀️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(`req_page_${statusFilter}_${page + 1}`)
+      .setLabel('▶️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= totalPages - 1)
+  );
+
+  await interaction.update({ embeds: [embed], components: [navRow] });
+}
+
+// ------------------------------------------------------
+// Request auto-expiry system
+// ------------------------------------------------------
+
+const REQUEST_EXPIRY_DAYS = 7;
+const EXPIRY_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+async function expireStaleRoleRequests() {
+  const payload = loadRoleRequests();
+  const now = Date.now();
+  let changed = false;
+
+  for (const guildId of Object.keys(payload.guilds || {})) {
+    const list = payload.guilds[guildId];
+    if (!Array.isArray(list)) continue;
+
+    for (const entry of list) {
+      if (entry.status !== 'pending') continue;
+
+      const createdAt = new Date(entry.createdAt).getTime();
+      if (isNaN(createdAt)) continue;
+
+      const ageDays = (now - createdAt) / (1000 * 60 * 60 * 24);
+      if (ageDays < REQUEST_EXPIRY_DAYS) continue;
+
+      entry.status = 'expired';
+      entry.decidedAt = new Date().toISOString();
+      entry.decisionReason = `Автоматически истёк (${REQUEST_EXPIRY_DAYS} дней)`;
+      changed = true;
+
+      // Try to update the approval message in Discord
+      try {
+        const guild = client.guilds.cache.get(guildId);
+        if (!guild) continue;
+
+        const context = await resolveRecruitmentWorkflowContext(guild);
+
+        // Edit approval message if it exists
+        if (context.approvalsChannel && entry.approvalMessageId) {
+          try {
+            const approvalMsg = await context.approvalsChannel.messages.fetch(entry.approvalMessageId);
+            if (approvalMsg) {
+              const updatedEmbed = EmbedBuilder.from(approvalMsg.embeds[0])
+                .setColor(0x95a5a6)
+                .setFooter({ text: `⏰ Истёк срок (${REQUEST_EXPIRY_DAYS} дн.) | ID: ${entry.id}` })
+                .setTimestamp(new Date(entry.decidedAt));
+
+              const disabledRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                  .setCustomId(`approve_role_request_${entry.id}`)
+                  .setLabel('✅ Одобрить')
+                  .setStyle(ButtonStyle.Success)
+                  .setDisabled(true),
+                new ButtonBuilder()
+                  .setCustomId(`deny_role_request_${entry.id}`)
+                  .setLabel('❌ Отклонить')
+                  .setStyle(ButtonStyle.Danger)
+                  .setDisabled(true)
+              );
+
+              await approvalMsg.edit({ embeds: [updatedEmbed], components: [disabledRow] });
+            }
+          } catch (err) {
+            console.error(`[Expiry] Failed to edit approval message for ${entry.id}:`, err.message);
+          }
+        }
+
+        // Notify in requests channel
+        if (context.roleRequestsChannel) {
+          const expiryEmbed = new EmbedBuilder()
+            .setTitle('⏰ Запрос истёк')
+            .setDescription(`Запрос на роль **${getRoleRequestPackLabel(entry.pack)}** для <@${entry.targetUserId}> истёк (${REQUEST_EXPIRY_DAYS} дней без решения).`)
+            .setColor(0x95a5a6)
+            .addFields({ name: 'Автор запроса', value: `<@${entry.requestedByUserId}>`, inline: true })
+            .setTimestamp();
+          await context.roleRequestsChannel.send({ embeds: [expiryEmbed] });
+        }
+
+        await sendAuditLog(guild, '⏰ Запрос истёк (авто)', [
+          { name: 'Целевой', value: `<@${entry.targetUserId}>`, inline: true },
+          { name: 'Роль', value: getRoleRequestPackLabel(entry.pack), inline: true },
+          { name: 'Автор', value: `<@${entry.requestedByUserId}>`, inline: true },
+          { name: 'ID', value: `\`${entry.id}\``, inline: false }
+        ], 0x95a5a6);
+      } catch (err) {
+        console.error(`[Expiry] Error processing expired request ${entry.id}:`, err.message);
+      }
+    }
+  }
+
+  if (changed) {
+    saveRoleRequests(payload);
+    console.log('[Expiry] Stale role requests expired.');
+  }
+}
+
+// ------------------------------------------------------
+// Master InteractionCreate dispatcher
+// ------------------------------------------------------
+
+async function handleInteractionCreate(interaction) {
+  // Button interactions
+  if (interaction.isButton()) {
+    const cid = interaction.customId;
+
+    // Role request panel buttons
+    if (cid.startsWith('role_request_panel_')) {
+      return handleRoleRequestPanelButton(interaction);
+    }
+
+    // Approve button
+    if (cid.startsWith('approve_role_request_')) {
+      return handleApproveButton(interaction);
+    }
+
+    // Deny button
+    if (cid.startsWith('deny_role_request_')) {
+      return handleDenyButton(interaction);
+    }
+
+    // Pagination buttons for /pending_requests
+    if (cid.startsWith('req_page_')) {
+      return handleRequestPageButton(interaction);
+    }
+  }
+
+  // Modal submissions
+  if (interaction.isModalSubmit()) {
+    const cid = interaction.customId;
+
+    if (cid.startsWith('role_request_modal_')) {
+      return handleRoleRequestModalSubmit(interaction);
+    }
+
+    if (cid.startsWith('deny_reason_modal_')) {
+      return handleDenyReasonModalSubmit(interaction);
+    }
+  }
+
+  // Slash commands
+  if (interaction.isChatInputCommand()) {
+    if (interaction.commandName === 'pending_requests') {
+      return handlePendingRequestsCommand(interaction);
+    }
+  }
 }
 
 const warnState = new Map();
@@ -814,7 +1524,72 @@ client.once(Events.ClientReady, async c => {
   });
   console.log(`[PRESENCE] Applied presence: ${CURRENT_BOT_PRESENCE}`);
   await refreshInviteCache();
-  console.log('[CMD] Slash command runtime is disabled. WebUI is the control plane.');
+
+  // Register slash commands at startup
+  try {
+    const { REST, Routes } = require('discord.js');
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    const guildId = process.env.GUILD_ID;
+    const clientId = process.env.CLIENT_ID || c.user.id;
+
+    const commands = [
+      new SlashCommandBuilder()
+        .setName('pending_requests')
+        .setDescription('Просмотр запросов на роли (для модераторов)')
+        .addStringOption(option =>
+          option
+            .setName('статус')
+            .setDescription('Фильтр по статусу')
+            .setRequired(false)
+            .addChoices(
+              { name: '⏳ Ожидающие', value: 'pending' },
+              { name: '✅ Одобренные', value: 'approved' },
+              { name: '❌ Отклонённые', value: 'rejected' },
+              { name: '⏰ Истёкшие', value: 'expired' },
+              { name: '📋 Все', value: 'all' }
+            )
+        )
+        .toJSON()
+    ];
+
+    if (guildId) {
+      await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
+      console.log('[CMD] Registered /pending_requests slash command for guild.');
+    }
+  } catch (err) {
+    console.error('[CMD] Failed to register slash commands:', err.message);
+  }
+
+  // Ensure role request panel exists in the requests channel
+  try {
+    const guildId = process.env.GUILD_ID;
+    if (guildId) {
+      const guild = await client.guilds.fetch(guildId);
+      await ensureRoleRequestPanel(guild);
+      console.log('[RoleRequests] Panel check complete.');
+
+      // Lock down #запросы-ролей: only bot can send messages, everyone else uses buttons
+      await lockdownRoleRequestsChannel(guild);
+    }
+  } catch (err) {
+    console.error('[RoleRequests] Failed to ensure panel:', err.message);
+  }
+
+  // Start auto-expiry timer
+  try {
+    await expireStaleRoleRequests();
+  } catch (err) {
+    console.error('[Expiry] Initial expiry check failed:', err.message);
+  }
+  setInterval(async () => {
+    try {
+      await expireStaleRoleRequests();
+    } catch (err) {
+      console.error('[Expiry] Periodic expiry check failed:', err.message);
+    }
+  }, EXPIRY_CHECK_INTERVAL_MS).unref();
+
+  console.log('[CMD] Role request system initialized with buttons, modals & auto-expiry.');
 });
 
 // Auto roles on member join (members + bots + invite mapping)
@@ -900,6 +1675,26 @@ client.on(Events.MessageCreate, async message => {
     await enforceRecruitmentAnnouncementMessage(message);
   } catch (err) {
     console.error('Recruitment enforcement error:', err);
+  }
+});
+
+// InteractionCreate — buttons, modals, slash commands
+client.on(Events.InteractionCreate, async interaction => {
+  try {
+    await handleInteractionCreate(interaction);
+  } catch (err) {
+    console.error('InteractionCreate error:', err);
+    // Try to respond to the user if we haven't already
+    try {
+      const content = '❌ Произошла ошибка при обработке взаимодействия.';
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp({ content, ephemeral: true });
+      } else {
+        await interaction.reply({ content, ephemeral: true });
+      }
+    } catch {
+      // can't respond — ignore
+    }
   }
 });
 
@@ -3086,12 +3881,46 @@ app.get('/recruitment', async (req, res) => {
         </div>
 
         <div class="glass-card" style="margin-top:14px;">
-          <h2 style="margin-top:0;font-size:1rem;">Запросы ролей через Discord</h2>
-          <div class="hint">Создание запросов: <strong>#${escapeHtml((cfg.channels && cfg.channels.roleRequests) || ROLE_REQUESTS_FALLBACK_CHANNEL)}</strong></div>
-          <div class="hint">Одобрение в закрытом канале: <strong>#${escapeHtml((cfg.channels && cfg.channels.approvals) || ROLE_APPROVALS_FALLBACK_CHANNEL)}</strong></div>
-          <div class="hint" style="margin-top:8px;">Команда для запроса: <strong>!роль</strong> (или <strong>:роль</strong>) <strong>&lt;лидер|зам|база&gt; @пользователь причина</strong></div>
-          <div class="hint">Команды для одобряющих ролей: <strong>!одобрить &lt;ID&gt;</strong> и <strong>!отклонить &lt;ID&gt; причина</strong></div>
-          <div class="hint" style="margin-top:6px;">Также можно ответить (reply) на сообщение бота в канале одобрений и написать <strong>!одобрить</strong> или <strong>!отклонить причина</strong>.</div>
+          <h2 style="margin-top:0;font-size:1rem;">Role Request Panel</h2>
+          <div class="hint">Requests channel: <strong>#${escapeHtml((cfg.channels && cfg.channels.roleRequests) || ROLE_REQUESTS_FALLBACK_CHANNEL)}</strong></div>
+          <div class="hint">Approvals channel: <strong>#${escapeHtml((cfg.channels && cfg.channels.approvals) || ROLE_APPROVALS_FALLBACK_CHANNEL)}</strong></div>
+          <div class="hint" style="margin-top:6px;">Panel message ID: <strong>${escapeHtml((state && state.roleRequestPanelMessageId) || '—')}</strong></div>
+
+          <form id="panelSettingsForm" style="margin-top:12px;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <div>
+                <label style="margin-top:0;">Button 1 — Leader label
+                  <input type="text" name="label_leader" value="${escapeHtml((state && state.roleRequestButtonLabels && state.roleRequestButtonLabels.leader_recruitment) || ROLE_REQUEST_PACK_LABELS.leader_recruitment)}" placeholder="Лидер" />
+                </label>
+                <label>Button 1 — Description
+                  <input type="text" name="desc_leader" value="${escapeHtml((state && state.roleRequestButtonDescriptions && state.roleRequestButtonDescriptions.leader_recruitment) || ROLE_REQUEST_PACK_DESCRIPTIONS_DEFAULT.leader_recruitment)}" placeholder="руководство подразделением набора" />
+                </label>
+              </div>
+              <div>
+                <label style="margin-top:0;">Button 2 — Deputy label
+                  <input type="text" name="label_deputy" value="${escapeHtml((state && state.roleRequestButtonLabels && state.roleRequestButtonLabels.deputy_recruitment) || ROLE_REQUEST_PACK_LABELS.deputy_recruitment)}" placeholder="Заместитель" />
+                </label>
+                <label>Button 2 — Description
+                  <input type="text" name="desc_deputy" value="${escapeHtml((state && state.roleRequestButtonDescriptions && state.roleRequestButtonDescriptions.deputy_recruitment) || ROLE_REQUEST_PACK_DESCRIPTIONS_DEFAULT.deputy_recruitment)}" placeholder="помощник лидера набора" />
+                </label>
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:4px;">
+              <div>
+                <label style="margin-top:0;">Button 3 — Member label
+                  <input type="text" name="label_member" value="${escapeHtml((state && state.roleRequestButtonLabels && state.roleRequestButtonLabels.member_base) || ROLE_REQUEST_PACK_LABELS.member_base)}" placeholder="Участник" />
+                </label>
+                <label>Button 3 — Description
+                  <input type="text" name="desc_member" value="${escapeHtml((state && state.roleRequestButtonDescriptions && state.roleRequestButtonDescriptions.member_base) || ROLE_REQUEST_PACK_DESCRIPTIONS_DEFAULT.member_base)}" placeholder="участник подразделения набора" />
+                </label>
+              </div>
+              <div style="display:flex;align-items:flex-end;">
+                <div class="btn-row" style="width:100%;">
+                  <button type="submit" class="primary" style="width:100%;">Save & Resend Panel</button>
+                </div>
+              </div>
+            </div>
+          </form>
         </div>
 
         <div class="glass-card" style="margin-top:14px;">
@@ -3299,6 +4128,39 @@ app.get('/recruitment', async (req, res) => {
         });
       }
 
+      var panelForm = document.getElementById('panelSettingsForm');
+      if (panelForm) {
+        panelForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var fd = new FormData(panelForm);
+
+          fetch('/recruitment/panel-settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              label_leader: (fd.get('label_leader') || '').toString().trim(),
+              label_deputy: (fd.get('label_deputy') || '').toString().trim(),
+              label_member: (fd.get('label_member') || '').toString().trim(),
+              desc_leader: (fd.get('desc_leader') || '').toString().trim(),
+              desc_deputy: (fd.get('desc_deputy') || '').toString().trim(),
+              desc_member: (fd.get('desc_member') || '').toString().trim()
+            })
+          })
+            .then(function (res) { return res.json().then(function (data) { return { ok: res.ok, data: data }; }); })
+            .then(function (result) {
+              if (!result.ok) {
+                showToast(result.data.message || 'Panel update failed', true);
+                return;
+              }
+              showToast(result.data.message || 'Panel updated', false);
+              setTimeout(function () { window.location.reload(); }, 1200);
+            })
+            .catch(function () {
+              showToast('Network error while updating panel', true);
+            });
+        });
+      }
+
     `;
 
     res.send(renderLayout('recruitment', bodyHtml, extraScript));
@@ -3502,15 +4364,122 @@ app.post('/recruitment/messages', async (req, res) => {
 app.post('/recruitment/role-requests', async (req, res) => {
   return res.status(410).json({
     ok: false,
-    message: 'Role requests are handled in Discord channels only. Use #запросы-ролей.'
+    message: 'Role requests are now handled via buttons in Discord. Use the panel in #запросы-ролей.'
   });
 });
 
 app.post('/recruitment/role-requests/:requestId/decision', async (req, res) => {
   return res.status(410).json({
     ok: false,
-    message: 'Role approvals are handled in Discord channels only. Use #одобрение-ролей.'
+    message: 'Role approvals are now handled via buttons in Discord. Use #одобрение-ролей.'
   });
+});
+
+// Re-send role request panel
+app.post('/recruitment/resend-panel', async (req, res) => {
+  try {
+    const guildId = process.env.GUILD_ID;
+    if (!guildId) return res.status(400).json({ ok: false, message: 'GUILD_ID not configured.' });
+    const guild = await client.guilds.fetch(guildId);
+    const context = await resolveRecruitmentWorkflowContext(guild);
+    if (!context.roleRequestsChannel) {
+      return res.status(404).json({ ok: false, message: 'Role requests channel not found.' });
+    }
+    const msg = await sendRoleRequestPanel(context.roleRequestsChannel);
+    saveRecruitmentStateForGuild(guildId, { roleRequestPanelMessageId: msg.id });
+    return res.json({ ok: true, message: `Panel sent (ID: ${msg.id}).` });
+  } catch (err) {
+    console.error('Role request panel resend error:', err);
+    return res.status(500).json({ ok: false, message: err.message || 'Failed to send panel.' });
+  }
+});
+
+// Save panel button labels/descriptions and resend panel
+app.post('/recruitment/panel-settings', async (req, res) => {
+  try {
+    const guildId = process.env.GUILD_ID;
+    if (!guildId) return res.status(400).json({ ok: false, message: 'GUILD_ID not configured.' });
+
+    const body = req.body || {};
+    const labels = {};
+    const descriptions = {};
+
+    // Validate labels — max 80 chars (Discord button label limit)
+    if (body.label_leader) labels.leader_recruitment = String(body.label_leader).slice(0, 80);
+    if (body.label_deputy) labels.deputy_recruitment = String(body.label_deputy).slice(0, 80);
+    if (body.label_member) labels.member_base = String(body.label_member).slice(0, 80);
+
+    if (body.desc_leader !== undefined) descriptions.leader_recruitment = String(body.desc_leader).slice(0, 200);
+    if (body.desc_deputy !== undefined) descriptions.deputy_recruitment = String(body.desc_deputy).slice(0, 200);
+    if (body.desc_member !== undefined) descriptions.member_base = String(body.desc_member).slice(0, 200);
+
+    // Save to state
+    saveRecruitmentStateForGuild(guildId, {
+      roleRequestButtonLabels: labels,
+      roleRequestButtonDescriptions: descriptions
+    });
+
+    // Try to delete old panel and send new one
+    const guild = await client.guilds.fetch(guildId);
+    const context = await resolveRecruitmentWorkflowContext(guild);
+    if (context.roleRequestsChannel) {
+      const state = getRecruitmentStateForGuild(guildId) || {};
+      if (state.roleRequestPanelMessageId) {
+        try {
+          const oldMsg = await context.roleRequestsChannel.messages.fetch(state.roleRequestPanelMessageId);
+          if (oldMsg) await oldMsg.delete();
+        } catch { /* already gone */ }
+      }
+      const msg = await sendRoleRequestPanel(context.roleRequestsChannel);
+      saveRecruitmentStateForGuild(guildId, { roleRequestPanelMessageId: msg.id });
+      return res.json({ ok: true, message: `Settings saved. Panel resent (ID: ${msg.id}).` });
+    }
+
+    return res.json({ ok: true, message: 'Settings saved. Could not find channel to resend panel.' });
+  } catch (err) {
+    console.error('Panel settings save error:', err);
+    return res.status(500).json({ ok: false, message: err.message || 'Failed to save panel settings.' });
+  }
+});
+
+// Get role requests list (read-only dashboard)
+app.get('/recruitment/role-requests-list', async (req, res) => {
+  try {
+    const guildId = process.env.GUILD_ID;
+    if (!guildId) return res.status(400).json({ ok: false, message: 'GUILD_ID not configured.' });
+
+    const statusFilter = req.query.status || 'all';
+    const { list } = getRoleRequestsForGuild(guildId);
+
+    let filtered;
+    if (statusFilter === 'all') {
+      filtered = [...list].reverse();
+    } else {
+      filtered = list.filter(r => r.status === statusFilter).reverse();
+    }
+
+    return res.json({
+      ok: true,
+      total: filtered.length,
+      requests: filtered.slice(0, 50).map(r => ({
+        id: r.id,
+        idShort: r.id.slice(0, 8),
+        requestedByUserId: r.requestedByUserId,
+        targetUserId: r.targetUserId,
+        pack: r.pack,
+        packLabel: getRoleRequestPackLabel(r.pack),
+        reason: r.reason || '—',
+        status: r.status,
+        createdAt: r.createdAt,
+        decidedAt: r.decidedAt,
+        decidedByUserId: r.decidedByUserId,
+        decisionReason: r.decisionReason || ''
+      }))
+    });
+  } catch (err) {
+    console.error('Role requests list error:', err);
+    return res.status(500).json({ ok: false, message: err.message || 'Failed to load requests.' });
+  }
 });
 
 app.post('/bot-status', async (req, res) => {

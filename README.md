@@ -3,15 +3,21 @@
 </p>
 
 <p align="center">
-  Node.js Discord bot for VPROJECT with recruitment category automation and policy-driven role request workflow.
+  Node.js Discord bot for VPROJECT — recruitment automation, button-based role requests, and a web management panel.
 </p>
 
 ## Features
 
-- Recruitment architecture management (channels/roles/pins) driven by `recruitment-architecture.json`
-- Discord-only role requests with configurable audience and approver roles (via recruitment workflow policy)
-- Basic moderation/automation helpers (auto-roles, message tracking)
-- Utilities and scripts for provisioning and health checks
+- **Button-based role request system** — interactive panel with Discord buttons + modal forms
+- **Approve / Deny workflow** — one-click buttons on request embeds for moderators
+- **`/pending_requests` slash command** — paginated view of open requests with status filter
+- **Auto-expiry** — stale requests expire automatically after 7 days
+- **Audit logging** — structured embed logs for every approval, denial and expiry
+- **WebUI panel settings** — customise button labels and descriptions from the browser
+- Recruitment architecture management driven by `recruitment-architecture.json`
+- Configurable workflow policy (audience, visibility, approver roles)
+- Auto-roles, message tracking, giveaway templates
+- PM2-based production deployment with health checks
 
 ## Quick start
 
@@ -23,104 +29,131 @@ npm ci
 
 ### 2) Configure environment
 
-- Create a `.env` file (never commit it):
-
 ```bash
 cp .env.example .env
 ```
 
-Fill at least:
+Required variables:
 - `DISCORD_TOKEN`
-- `GUILD_ID` (needed for one-off setup scripts)
+- `GUILD_ID`
 
-### 3) Run
+### 3) Register slash commands
 
 ```bash
-node src/index.js
+npm run register
 ```
 
-## Role requests (Discord channels)
+### 4) Run
 
-This workflow is policy-driven through `recruitment-architecture.json` (`default.workflow` / `guilds.<id>.workflow`).
+Development:
 
-Default policy in this repo:
-- `requestAudience: all_members` (all guild users can create requests)
-- `categoryVisibility: public` (category visible to everyone)
-- approvals channel remains private by explicit channel overwrite
-- approvers include `P| Admin (Full)`, `P| Admin (Mod)`, and `Модератор Discord`
+```bash
+npm start
+```
 
-Default channel names (configurable in `recruitment-architecture.json`):
-- `📝│запросы-ролей` — request creation
-- `🔐│одобрение-ролей` — decisions by configured approver roles
+Production (PM2):
 
-Commands:
-- In `📝│запросы-ролей`:
-  - `!роль <лидер|зам|база> @user <reason>`
-  - `:роль <лидер|зам|база> @user <reason>`
-- In `🔐│одобрение-ролей`:
-  - `!одобрить <ID>` / `:одобрить <ID>`
-  - `!отклонить <ID> <reason>` / `:отклонить <ID> <reason>`
+```bash
+pm2 start ecosystem.config.js
+pm2 save
+```
 
-Reply approvals (recommended):
-- In `🔐│одобрение-ролей`, reply to the bot message that contains the role request and send:
-  - `!одобрить` (or `:одобрить`)
-  - `!отклонить <reason>` (or `:отклонить <reason>`)
-  The bot will auto-detect the request ID from the replied-to message.
+## Role request system
 
-## User-facing update (2026-03)
+The role request flow uses **Discord buttons and modal forms** — no text commands required.
 
-- The role request flow is now open to all server members.
-- Category visibility for the recruitment flow is now public.
-- `📝│запросы-ролей` is available for submitting requests.
-- `🔐│одобрение-ролей` remains private for the moderation workflow.
+### How it works
 
-## One-off setup: create role request category + channels
+1. A **panel embed** is posted in `📝│запросы-ролей` with one button per role pack (Лидер, Заместитель, Участник).
+2. A member clicks a button → a **modal form** pops up asking for the target user and reason.
+3. The bot creates a request embed in `🔐│одобрение-ролей` with **Approve** and **Deny** buttons.
+4. A moderator clicks **Approve** to grant the role, or **Deny** to open a reason modal.
+5. The original requester is notified in-channel and the request embed is updated.
+
+### Auto-expiry & audit
+
+- Requests older than **7 days** are automatically expired.
+- Every action (approve, deny, expire) is recorded via a structured audit-log embed.
+
+### `/pending_requests` command
+
+Moderators can run `/pending_requests` (optionally filtering by status) to see a paginated list of open requests.
+
+### Legacy text commands (deprecated)
+
+The old `!роль` / `!одобрить` / `!отклонить` text commands still work but are **not recommended**. Use the button-based panel instead.
+
+## One-off setup
+
+### Create role request category + channels
 
 ```bash
 node scripts/setup-role-requests-discord.js
 ```
 
-Requires `.env` with:
-- `DISCORD_TOKEN`
-- `GUILD_ID`
+Creates the category, text channels, permission overwrites, and stores IDs in `data/recruitment-architecture-state.json`.
 
-The script creates the category `🛂│запросы-ролей`, the two text channels, sets permission overwrites, and stores IDs into `data/recruitment-architecture-state.json` (this file is intentionally ignored by git).
+### Update recruitment channel embeds
 
-Note: this script now delegates to the canonical recruitment manager setup, so permissions stay consistent with policy and WebUI setup behavior.
+```bash
+node scripts/update-recruitment-embeds.js
+```
 
-## WebUI policy management
+Sends or refreshes the standardised info embeds in all five recruitment channels.
 
-Open `/recruitment` in WebUI and use **Role Request Workflow Policy** to:
-- set request audience (`all_members` or `staff_only`)
-- set category visibility (`public` or `restricted`)
-- configure additional approver roles by name or by role ID
-- optionally apply setup immediately after saving policy
+## WebUI
 
-### WebUI message templates
+The bot exposes a web panel on port **5011** (configurable via `config.json`).
 
-Open `/recruitment` in WebUI and use **Шаблоны сообщений (запросы ролей)** to customize the automated messages:
-- user reply after creating a request
-- approvals channel post on request creation
-- approvals channel post after approve/reject
-- request channel post after approve/reject
+### Role Request Panel settings
 
-Notes:
-- The bot adds a hidden marker to approvals-channel posts so reply-based approvals can work without showing full IDs in public text.
+Open `/recruitment` → **Role Request Panel** section to:
+- Edit button **labels** and **descriptions** for each role pack
+- Save & automatically resend the panel embed with updated text
 
-## Security / what not to commit
+### Workflow policy
 
-This repo is configured to avoid committing secrets and runtime state.
+Open `/recruitment` → **Role Request Workflow Policy** to:
+- Set request audience (`all_members` / `staff_only`)
+- Set category visibility (`public` / `restricted`)
+- Configure approver roles
+- Apply setup immediately
 
-- Never commit `.env` (contains tokens/passwords)
-- Keep secrets in environment variables, not in tracked files
-- Files intentionally ignored by git:
-  - `.env`
-  - `node_modules/`, `logs/`, `backups/`
-  - runtime state under `data/` such as `messages.json`, `recruitment-architecture-state.json`, `recruitment-role-requests.json`
+### Message templates
 
-## Deployment notes
+Open `/recruitment` → **Шаблоны сообщений** to customise automated messages (request creation, approval, denial).
 
-Systemd unit files and helper scripts are included in the repo. Adapt paths/variables to your server environment.
+## Project structure
+
+```
+src/
+  index.js                 — main bot + web panel
+  registerCommands.js      — slash command registration
+  commands/                — slash & admin commands
+  utils/
+    embedFactory.js
+    recruitmentArchitectureManager.js
+    telegram.js
+data/                      — runtime state (git-ignored)
+scripts/                   — one-off setup & maintenance scripts
+ecosystem.config.js        — PM2 configuration
+```
+
+## Security
+
+- Never commit `.env` (tokens, passwords)
+- Git-ignored runtime files: `data/`, `logs/`, `backups/`, `node_modules/`
+
+## Deployment
+
+PM2 is the recommended process manager:
+
+```bash
+pm2 start ecosystem.config.js
+pm2 save
+```
+
+Systemd unit files (`vproject-bot.service`, `vproject-bot-healthcheck.*`) and helper scripts (`bot.sh`, `24-7-start.sh`) are included for VPS deployment. Adapt paths to your environment.
 
 ## License
 
